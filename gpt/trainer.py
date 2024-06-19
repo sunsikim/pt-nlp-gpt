@@ -16,6 +16,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
 
+import inspect
 import os
 import time
 import math
@@ -27,7 +28,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from model import GPT2Config, GPT2Model
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -192,39 +193,8 @@ if init_from == "scratch":
             "defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)"
         )
     model_args["vocab_size"] = meta_vocab_size if meta_vocab_size is not None else 50304
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-elif init_from == "resume":
-    print(f"Resuming training from {out_dir}")
-    # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, "ckpt.pt")
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint["model_args"]
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ["n_layer", "n_head", "n_embd", "block_size", "bias", "vocab_size"]:
-        model_args[k] = checkpoint_model_args[k]
-    # create the model
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
-    state_dict = checkpoint["model"]
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = "_orig_mod."
-    for k, v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix) :]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint["iter_num"]
-    best_val_loss = checkpoint["best_val_loss"]
-elif init_from.startswith("gpt2"):
-    print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
-    override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
-    for k in ["n_layer", "n_head", "n_embd", "block_size", "bias", "vocab_size"]:
-        model_args[k] = getattr(model.config, k)
+    gptconf = GPT2Config(**model_args)
+    model = GPT2Model(gptconf)
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
@@ -237,11 +207,35 @@ model.to(device)
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 
 # optimizer
-optimizer = model.configure_optimizers(
-    weight_decay, learning_rate, (beta1, beta2), device_type
+# start with all of the candidate parameters
+param_dict = {pn: p for pn, p in model.named_parameters()}
+# filter out those that do not require grad
+param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+# create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+# i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+optim_groups = [
+    {"params": decay_params, "weight_decay": weight_decay},
+    {"params": nodecay_params, "weight_decay": 0.0},
+]
+num_decay_params = sum(p.numel() for p in decay_params)
+num_nodecay_params = sum(p.numel() for p in nodecay_params)
+print(
+    f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters"
 )
-if init_from == "resume":
-    optimizer.load_state_dict(checkpoint["optimizer"])
+print(
+    f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters"
+)
+# Create AdamW optimizer and use the fused version if it is available
+fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+use_fused = fused_available and device_type == "cuda"
+extra_args = dict(fused=True) if use_fused else dict()
+optimizer = torch.optim.AdamW(
+    optim_groups, lr=learning_rate, betas=(beta1, beta2), **extra_args
+)
+print(f"using fused AdamW: {use_fused}")
+
 checkpoint = None  # free up memory
 
 # compile the model
@@ -298,7 +292,6 @@ X, Y = get_batch("train")  # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model  # unwrap DDP container if needed
-running_mfu = -1.0
 while True:
 
     # determine and set the learning rate for this iteration
@@ -319,7 +312,6 @@ while True:
                     "train/loss": losses["train"],
                     "val/loss": losses["val"],
                     "lr": lr,
-                    "mfu": running_mfu * 100,  # convert to percentage
                 }
             )
         if losses["val"] < best_val_loss or always_save_checkpoint:
@@ -376,12 +368,7 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5:  # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
-        print(
-            f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%"
-        )
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
     iter_num += 1
     local_iter_num += 1
 
