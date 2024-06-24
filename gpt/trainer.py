@@ -47,7 +47,6 @@ class GPT2Trainer:
     def train(self, model):
         # initialize a GradScaler. If enabled=False scaler is a no-op
         scaler = torch.cuda.amp.GradScaler(enabled=(self.dtype == "float16"))
-        checkpoint = None  # free up memory
         X, Y = self.batch_loader.get_batch("train")  # fetch the very first batch
         t0 = time.time()
         local_iter_num = 0  # number of iterations in the lifetime of this process
@@ -99,9 +98,8 @@ class GPT2Trainer:
                     )
                 with self.context:
                     logits, loss = model(X, Y)
-                    loss = (
-                            loss / self.trainer_cfg.gradient_accumulation_steps
-                    )  # scale the loss to account for gradient accumulation
+                    # scale the loss to account for gradient accumulation
+                    loss /= self.trainer_cfg.gradient_accumulation_steps
                 # immediately async prefetch next batch while model is doing the forward pass on the GPU
                 X, Y = self.batch_loader.get_batch("train")
                 # backward pass, with gradient scaling if training in fp16
@@ -172,4 +170,3 @@ class GPT2Trainer:
     @property
     def ptdtype(self):
         return torch.bfloat16 if self.dtype == "bfloat16" else torch.float16
-
