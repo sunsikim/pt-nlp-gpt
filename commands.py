@@ -1,6 +1,6 @@
 import typer
 import jobs
-from jobs.config import ExecutableJobs
+from jobs.configure import ExecutableJobs
 from typing import Annotated
 from typer import Typer
 
@@ -14,17 +14,26 @@ def list_jobs():
         print(job_executor.name, job_executor.__doc__)
 
 
-@app.command("run-jobs")
-def run_jobs(
-    job_names: Annotated[
+@app.command("run-job")
+def run_job(
+    job_prefix: Annotated[
         str,
-        typer.Option(
+        typer.Argument(
             envvar="APP_JOBS",
             show_envvar=True,
             show_default=True,
-            help="comma-separated text of job names to be executed",
+            help="string of job name to be executed",
         ),
-    ] = "preprocess,train"
+    ] = "preprocess",
+    data_type: Annotated[
+        str,
+        typer.Argument(
+            envvar="DATA_TYPE",
+            show_envvar=True,
+            show_default=True,
+            help="one of 'shakespeare', 'openwebtext'",
+        ),
+    ] = "shakespeare",
 ):
     # register executable jobs
     executable_jobs = {}
@@ -38,8 +47,8 @@ def run_jobs(
             executable_jobs[job_executor.name] = job_executor.execute
 
     # execute input jobs
-    for job_name in job_names.split(","):
-        if job_name not in executable_jobs:
-            raise ValueError(f"Job with name '{job_name}' is not registered")
-        else:
-            executable_jobs[job_name]()
+    job_name = f"{job_prefix}-{data_type}"
+    if job_name not in executable_jobs:
+        raise ValueError(f"Job with name '{job_name}' is not registered")
+    else:
+        executable_jobs[job_name]()

@@ -1,29 +1,14 @@
 import math
-from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
-
-@dataclass
-class GPT2Config:
-    """
-    Configuration class for GPT2 Model
-    """
-
-    block_size: int = 1024
-    vocab_size: int = 50304
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True
+from jobs.configure import GPT2Config
 
 
 class GPT2Attention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config: GPT2Config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
@@ -68,7 +53,7 @@ class GPT2Attention(nn.Module):
 
 class GPT2MLP(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config: GPT2Config):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.gelu = nn.GELU()
@@ -85,7 +70,7 @@ class GPT2MLP(nn.Module):
 
 class GPT2Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config: GPT2Config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd, bias=config.bias)
         self.attn = GPT2Attention(config)
@@ -100,7 +85,7 @@ class GPT2Block(nn.Module):
 
 class GPT2Model(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config: GPT2Config):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
