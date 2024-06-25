@@ -6,3 +6,4 @@ tiktoken
 datasets
 tqdm
 wandb
+jupyterlab
