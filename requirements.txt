@@ -7,3 +7,4 @@ datasets
 tqdm
 wandb
 jupyterlab
+accelerate

@@ -11,7 +11,7 @@ class EvaluateJob(ExecutableJobs):
     Sample from a trained model
     """
 
-    def __init__(self, job_name="evaluate-shakespeare"):
+    def __init__(self, job_name="evaluate"):
         super(EvaluateJob, self).__init__(job_name)
         self.data_type = job_name.split("-")[1]
         self.data_dir = self.temp_dir.joinpath(f"data/{self.data_type}")
