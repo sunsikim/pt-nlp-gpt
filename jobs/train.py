@@ -1,15 +1,12 @@
-import inspect
 import os
 import pickle
 import logging
 import torch
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
-
-from dataclasses import asdict
+import accelerate
+import time
 from gpt.model import GPT2Model
-from gpt.data import BatchLoader
-from gpt.trainer import GPT2Trainer, LinearWarmupCosineDecay, define_optimizer
+from gpt.data import GPT2Dataset
+from gpt.trainer import LinearWarmupCosineDecay, define_optimizer
 from jobs.configure import ExecutableJobs, load_config
 
 
@@ -27,12 +24,13 @@ class TrainJob(ExecutableJobs):
         self.model_cfg = load_config(self.project_dir, "model")
         self.optimizer_cfg = load_config(self.project_dir, "optimizer")
         self.trainer_cfg = load_config(self.project_dir, "trainer")
+        self.best_val_loss = 1e9
+
+        ckpt_dir = self.temp_dir.joinpath("checkpoints")
+        if ckpt_dir.exists():
+            os.system(f"rm -rf {ckpt_dir}")
 
     def execute(self):
-        torch.manual_seed(1337)
-        torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
-        torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
-
         tokens_per_iter = (
             self.trainer_cfg.gradient_accumulation_steps
             * self.trainer_cfg.batch_size
@@ -40,14 +38,7 @@ class TrainJob(ExecutableJobs):
         )
         logging.info(f"tokens per iteration will be: {tokens_per_iter:,}")
 
-        logging.info("Define batch loader")
-        batch_loader = BatchLoader(
-            data_dir=self.data_dir,
-            block_size=self.model_cfg.block_size,
-            batch_size=self.trainer_cfg.batch_size,
-            device=self.device
-        )
-
+        torch.manual_seed(1337)
         logging.info("Deriving vocab_size from the dataset")
         meta_path = os.path.join(self.data_dir, "meta.pkl")
         if os.path.exists(meta_path):
@@ -57,12 +48,26 @@ class TrainJob(ExecutableJobs):
             print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
             self.model_cfg.vocab_size = meta_vocab_size
 
-        logging.info("Initialize a new model from scratch")
-        model_args = asdict(self.model_cfg)
+        logging.info("Define train objects")
         model = GPT2Model(self.model_cfg)
-        model.to(self.device)
-
-        logging.info("Define optimizer")
+        train_loader = torch.utils.data.DataLoader(
+            dataset=GPT2Dataset(
+                data_dir=self.data_dir,
+                block_size=self.model_cfg.block_size,
+                split="train",
+            ),
+            batch_size=self.trainer_cfg.batch_size,
+            shuffle=True,
+        )
+        validation_loader = torch.utils.data.DataLoader(
+            dataset=GPT2Dataset(
+                data_dir=self.data_dir,
+                block_size=self.model_cfg.block_size,
+                split="val",
+            ),
+            batch_size=self.trainer_cfg.batch_size,
+            shuffle=True,
+        )
         optimizer = define_optimizer(
             model=model,
             weight_decay=self.optimizer_cfg.weight_decay,
@@ -76,31 +81,62 @@ class TrainJob(ExecutableJobs):
             warmup_steps=self.trainer_cfg.warmup_iters,
             max_steps=self.trainer_cfg.max_iters,
         )
-
-        logging.info("compiling the model... (takes a ~minute)")
-        model = torch.compile(model)  # requires PyTorch 2.0
-
-        logging.info("start training")
-        trainer = GPT2Trainer(
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-            batch_loader=batch_loader,
-            trainer_cfg=self.trainer_cfg,
-            model_dir=self.model_dir,
-            model_args=model_args,
+        project_config = accelerate.utils.ProjectConfiguration(
+            project_dir=str(self.temp_dir),
+            automatic_checkpoint_naming=True,
+            total_limit=50,
         )
-        trainer.train(model)
+        accelerator = accelerate.Accelerator(
+            project_config=project_config,
+            gradient_accumulation_steps=self.trainer_cfg.gradient_accumulation_steps,
+        )
+        model, train_loader, validation_loader, optimizer, scheduler = accelerator.prepare(
+            model, train_loader, validation_loader, optimizer, lr_scheduler
+        )
+        # model = torch.compile(model)  # requires PyTorch 2.0
 
-    @property
-    def device(self) -> str:
-        if torch.cuda.is_available():
-            ddp_local_rank = os.environ.get("LOCAL_RANK", -1)
-            return "cuda" if ddp_local_rank == -1 else f"cuda:{ddp_local_rank}"
-        else:
-            return "cpu"
+        logging.info("Start training")
+        for batch_idx, train_batch in enumerate(train_loader, start=1):
+            step_start = time.time()
+            optimizer.zero_grad()
+            inputs, targets = train_batch
+            with accelerator.accumulate(model):
+                _, loss = model(inputs, targets)
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    max_norm = self.trainer_cfg.grad_clip
+                    accelerator.clip_grad_norm_(model.parameters(), max_norm)
+                optimizer.step()
+                scheduler.step()
+            step_elapse = (time.time() - step_start) * 1000
 
-    @property
-    def device_type(self) -> str:
-        # for later use in torch.autocast
-        # note: float16 data type will automatically use a GradScaler
-        return "cuda" if "cuda" in self.device else "cpu"
+            if batch_idx % self.trainer_cfg.log_interval == 0 and accelerator.is_main_process:
+                loss_estimate = loss.item() * self.trainer_cfg.gradient_accumulation_steps
+                logging.info(f"step {batch_idx}: loss {loss_estimate:.4f}, time {step_elapse:.2f}ms")
+
+            if batch_idx % self.trainer_cfg.eval_interval == 0 and accelerator.is_main_process:
+                model.eval()
+                train_loss = self.evaluate_loss(model, train_loader)
+                val_loss = self.evaluate_loss(model, validation_loader)
+                logging.info(f"step {batch_idx}: train loss {train_loss:.4f}, val loss {val_loss:.4f}")
+                model.train()
+                if val_loss < self.best_val_loss:
+                    accelerator.save_state()
+
+            if batch_idx >= self.trainer_cfg.max_iters:
+                break
+
+        logging.info("Finished training")
+        accelerator.wait_for_everyone()
+        model = accelerator.unwrap_model(model)
+        accelerator.save_model(model, str(self.model_dir))
+
+    @torch.no_grad()
+    def evaluate_loss(self, model, batch_loader):
+        losses = torch.zeros(self.trainer_cfg.eval_iters)
+        for iter_idx, eval_batch in enumerate(batch_loader):
+            if iter_idx == self.trainer_cfg.eval_iters:
+                return losses.mean()
+            inputs, targets = eval_batch
+            _, loss = model(inputs, targets)
+            losses[iter_idx] = loss.item()

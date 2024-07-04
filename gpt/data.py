@@ -26,39 +26,3 @@ class GPT2Dataset(torch.utils.data.Dataset):
         x = torch.from_numpy((self.data[idx: idx_ub]).astype(np.int64))
         y = torch.from_numpy((self.data[idx + 1: idx_ub + 1]).astype(np.int64))
         return x, y
-
-
-class BatchLoader:
-
-    def __init__(
-        self,
-        data_dir: pathlib.Path,
-        block_size: int,
-        batch_size: int,
-        device: str,
-    ):
-        self.data_dir = data_dir
-        self.train_dataset = GPT2Dataset(data_dir, block_size, "train")
-        self.val_dataset = GPT2Dataset(data_dir, block_size, "val")
-        self.block_size = block_size
-        self.batch_size = batch_size
-        self.device = device
-
-    def get_batch(self, split: str):
-        data = self.train_dataset if split == "train" else self.val_dataset
-        ix = torch.randint(len(data) - self.block_size, (self.batch_size,))
-        xs, ys = [], []
-        for i in ix:
-            x, y = data[i]
-            xs.append(x)
-            ys.append(y)
-        x = torch.stack(xs)
-        y = torch.stack(ys)
-        if self.device.startswith("cuda"):
-            # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-            x, y = x.pin_memory().to(
-                self.device, non_blocking=True
-            ), y.pin_memory().to(self.device, non_blocking=True)
-        else:
-            x, y = x.to(self.device), y.to(self.device)
-        return x, y
