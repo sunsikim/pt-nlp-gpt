@@ -95,8 +95,8 @@ class TrainerConfig:
     wandb_run_name: str = "gpt2"
 
 
-def load_config(project_dir: pathlib.Path, data_type: str, config_type: str):
-    config_path = project_dir.joinpath(f"configs/{data_type}.json")
+def load_config(project_dir: pathlib.Path, config_type: str):
+    config_path = project_dir.joinpath(f"configs/shakespeare.json")
     with open(config_path, "r") as f:
         special_configs = json.load(f)
     if config_type == "model":

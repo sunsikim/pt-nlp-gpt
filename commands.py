@@ -14,41 +14,30 @@ def list_jobs():
         print(job_executor.name, job_executor.__doc__)
 
 
-@app.command("run-job")
-def run_job(
-    job_prefix: Annotated[
+@app.command("run-jobs")
+def run_jobs(
+    jobs: Annotated[
         str,
         typer.Argument(
             envvar="APP_JOBS",
             show_envvar=True,
             show_default=True,
-            help="string of job name to be executed",
+            help="comma-separated text of job names to be executed",
         ),
-    ] = "preprocess",
-    data_type: Annotated[
-        str,
-        typer.Argument(
-            envvar="DATA_TYPE",
-            show_envvar=True,
-            show_default=True,
-            help="one of 'shakespeare', 'openwebtext'",
-        ),
-    ] = "shakespeare",
+    ] = "preprocess,train,evaluate",
 ):
     # register executable jobs
     executable_jobs = {}
     for job in ExecutableJobs.__subclasses__():
-        job_executor = job()
-        if job_executor.name in executable_jobs:
-            raise ValueError(
-                f"Found multiple jobs with duplicated name '{job_executor.name}'"
-            )
+        _job = job()
+        if _job.name in executable_jobs:
+            raise ValueError(f"Found multiple jobs with duplicated name '{_job.name}'")
         else:
-            executable_jobs[job_executor.name] = job_executor.execute
+            executable_jobs[_job.name] = _job.execute
 
     # execute input jobs
-    job_name = f"{job_prefix}-{data_type}"
-    if job_name not in executable_jobs:
-        raise ValueError(f"Job with name '{job_name}' is not registered")
-    else:
-        executable_jobs[job_name]()
+    for job_name in jobs.split(","):
+        if job_name not in executable_jobs:
+            raise ValueError(f"Job with name '{job_name}' is not registered")
+        else:
+            executable_jobs[job_name]()
