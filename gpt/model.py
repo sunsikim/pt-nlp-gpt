@@ -173,37 +173,3 @@ class GPT2Model(nn.Module):
         for block in self.transformer.h:
             if hasattr(block.attn, "bias"):
                 block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
-
-    @torch.no_grad()
-    def generate(
-        self,
-        input_ids: torch.LongTensor,
-        max_new_tokens: int,
-        temperature=1.0,
-        top_k=None,
-    ):
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        """
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            cropped_input_ids = (
-                input_ids
-                if input_ids.size(1) <= self.config.block_size
-                else input_ids[:, -self.config.block_size :]
-            )
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(cropped_input_ids)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                logit_lb = torch.topk(logits, min(top_k, logits.size(-1))).values
-                logits[logits < logit_lb[:, [-1]]] = -float("inf")
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            input_ids = torch.cat((input_ids, next_token), dim=1)
-
-        return input_ids
