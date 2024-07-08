@@ -5,6 +5,6 @@ requests
 tiktoken
 datasets
 tqdm
-wandb
+tensorborad
 jupyterlab
 accelerate

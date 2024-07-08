@@ -1,11 +1,11 @@
 import os
 import pickle
-import logging
 import torch
 import accelerate
 import time
 from gpt.model import GPT2Model
 from gpt.data import GPT2Dataset
+from accelerate.logging import get_logger
 from gpt.trainer import LinearWarmupCosineDecay, define_optimizer
 from jobs.configure import ExecutableJobs, load_config
 
@@ -21,6 +21,8 @@ class TrainJob(ExecutableJobs):
         self.data_dir = self.temp_dir.joinpath("data")
         self.model_dir = self.temp_dir.joinpath("models")
         self.model_dir.mkdir(exist_ok=True, parents=True)
+        self.log_dir = self.temp_dir.joinpath("logs")
+        self.log_dir.mkdir(exist_ok=True, parents=True)
         self.model_cfg = load_config(self.project_dir, "model")
         self.optimizer_cfg = load_config(self.project_dir, "optimizer")
         self.trainer_cfg = load_config(self.project_dir, "trainer")
@@ -31,15 +33,27 @@ class TrainJob(ExecutableJobs):
             os.system(f"rm -rf {ckpt_dir}")
 
     def execute(self):
+        project_config = accelerate.utils.ProjectConfiguration(
+            project_dir=str(self.temp_dir),
+            logging_dir=str(self.log_dir),
+            automatic_checkpoint_naming=True,
+            total_limit=50,
+        )
+        accelerator = accelerate.Accelerator(
+            project_config=project_config,
+            log_with="tensorboard",
+            gradient_accumulation_steps=self.trainer_cfg.gradient_accumulation_steps,
+        )
+        logger = get_logger(__name__, log_level="INFO")
         tokens_per_iter = (
             self.trainer_cfg.gradient_accumulation_steps
             * self.trainer_cfg.batch_size
             * self.model_cfg.block_size
         )
-        logging.info(f"tokens per iteration will be: {tokens_per_iter:,}")
+        logger.info(f"tokens per iteration will be: {tokens_per_iter:,}")
 
         torch.manual_seed(1337)
-        logging.info("Deriving vocab_size from the dataset")
+        logger.info("Deriving vocab_size from the dataset")
         meta_path = os.path.join(self.data_dir, "meta.pkl")
         if os.path.exists(meta_path):
             with open(meta_path, "rb") as f:
@@ -48,7 +62,7 @@ class TrainJob(ExecutableJobs):
             print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
             self.model_cfg.vocab_size = meta_vocab_size
 
-        logging.info("Define train objects")
+        logger.info("Define train objects")
         model = GPT2Model(self.model_cfg)
         train_loader = torch.utils.data.DataLoader(
             dataset=GPT2Dataset(
@@ -81,21 +95,13 @@ class TrainJob(ExecutableJobs):
             warmup_steps=self.trainer_cfg.warmup_iters,
             max_steps=self.trainer_cfg.max_iters,
         )
-        project_config = accelerate.utils.ProjectConfiguration(
-            project_dir=str(self.temp_dir),
-            automatic_checkpoint_naming=True,
-            total_limit=50,
-        )
-        accelerator = accelerate.Accelerator(
-            project_config=project_config,
-            gradient_accumulation_steps=self.trainer_cfg.gradient_accumulation_steps,
-        )
         model, train_loader, validation_loader, optimizer, scheduler = accelerator.prepare(
             model, train_loader, validation_loader, optimizer, lr_scheduler
         )
-        # model = torch.compile(model)  # requires PyTorch 2.0
 
-        logging.info("Start training")
+        logger.info("Start training", main_process_only=False, in_order=True)
+        accelerator.init_trackers(f"nanoGPT-{int(time.time())}")
+        tracker_idx = 0
         for batch_idx, train_batch in enumerate(train_loader, start=1):
             step_start = time.time()
             optimizer.zero_grad()
@@ -112,21 +118,24 @@ class TrainJob(ExecutableJobs):
 
             if batch_idx % self.trainer_cfg.log_interval == 0 and accelerator.is_main_process:
                 loss_estimate = loss.item() * self.trainer_cfg.gradient_accumulation_steps
-                logging.info(f"step {batch_idx}: loss {loss_estimate:.4f}, time {step_elapse:.2f}ms")
+                logger.info(f"step {batch_idx}: loss {loss_estimate:.4f}, time {step_elapse:.2f}ms")
 
             if batch_idx % self.trainer_cfg.eval_interval == 0 and accelerator.is_main_process:
                 model.eval()
                 train_loss = self.evaluate_loss(model, train_loader)
                 val_loss = self.evaluate_loss(model, validation_loader)
-                logging.info(f"step {batch_idx}: train loss {train_loss:.4f}, val loss {val_loss:.4f}")
+                logger.info(f"step {batch_idx}: train loss {train_loss:.4f}, val loss {val_loss:.4f}")
+                accelerator.log({"train_loss": train_loss, "val_loss": val_loss}, step=tracker_idx)
+                tracker_idx += 1
                 model.train()
                 if val_loss < self.best_val_loss:
                     accelerator.save_state()
+                    self.best_val_loss = val_loss
 
             if batch_idx >= self.trainer_cfg.max_iters:
                 break
 
-        logging.info("Finished training")
+        logger.info("Finished training")
         accelerator.wait_for_everyone()
         model = accelerator.unwrap_model(model)
         accelerator.save_model(model, str(self.model_dir))
