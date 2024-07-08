@@ -27,6 +27,8 @@ class TrainJob(ExecutableJobs):
         self.optimizer_cfg = load_config(self.project_dir, "optimizer")
         self.trainer_cfg = load_config(self.project_dir, "trainer")
         self.best_val_loss = 1e9
+        self.val_loss_endured = 0
+        self.endurance = 10
 
         ckpt_dir = self.temp_dir.joinpath("checkpoints")
         if ckpt_dir.exists():
@@ -59,7 +61,7 @@ class TrainJob(ExecutableJobs):
             with open(meta_path, "rb") as f:
                 meta = pickle.load(f)
             meta_vocab_size = meta["vocab_size"]
-            print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+            logger.info(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
             self.model_cfg.vocab_size = meta_vocab_size
 
         logger.info("Define train objects")
@@ -99,7 +101,7 @@ class TrainJob(ExecutableJobs):
             model, train_loader, validation_loader, optimizer, lr_scheduler
         )
 
-        logger.info("Start training", main_process_only=False, in_order=True)
+        logger.info(f"Start training in GPU:{accelerator.process_index}", main_process_only=False)
         accelerator.init_trackers(f"nanoGPT-{int(time.time())}")
         tracker_idx = 0
         for batch_idx, train_batch in enumerate(train_loader, start=1):
@@ -116,23 +118,36 @@ class TrainJob(ExecutableJobs):
                 scheduler.step()
             step_elapse = (time.time() - step_start) * 1000
 
-            if batch_idx % self.trainer_cfg.log_interval == 0 and accelerator.is_main_process:
+            if batch_idx % self.trainer_cfg.log_interval == 0:
                 loss_estimate = loss.item() * self.trainer_cfg.gradient_accumulation_steps
                 logger.info(f"step {batch_idx}: loss {loss_estimate:.4f}, time {step_elapse:.2f}ms")
 
-            if batch_idx % self.trainer_cfg.eval_interval == 0 and accelerator.is_main_process:
+            # if evaluation process is executed only in the main process, process is hanged without any message
+            # more things to study in https://huggingface.co/docs/accelerate/basic_tutorials/troubleshooting
+            if batch_idx % self.trainer_cfg.eval_interval == 0:
                 model.eval()
                 train_loss = self.evaluate_loss(model, train_loader)
+                train_loss = accelerator.gather(train_loss).mean()
                 val_loss = self.evaluate_loss(model, validation_loader)
+                val_loss = accelerator.gather(val_loss).mean()
                 logger.info(f"step {batch_idx}: train loss {train_loss:.4f}, val loss {val_loss:.4f}")
                 accelerator.log({"train_loss": train_loss, "val_loss": val_loss}, step=tracker_idx)
                 tracker_idx += 1
                 model.train()
                 if val_loss < self.best_val_loss:
                     accelerator.save_state()
+                    self.val_loss_endured = 0
                     self.best_val_loss = val_loss
+                elif self.val_loss_endured >= self.endurance:
+                    # if validation loss has not decreasing for self.endurance evaluations, set flag
+                    accelerator.set_trigger()
+                else:
+                    self.val_loss_endured += 1
 
             if batch_idx >= self.trainer_cfg.max_iters:
+                logger.info("Step iteration reached max iteration number")
+            elif accelerator.check_trigger():
+                logger.info(f"Validation loss not decreased for {self.endurance} evaluations")
                 break
 
         logger.info("Finished training")
@@ -142,10 +157,11 @@ class TrainJob(ExecutableJobs):
 
     @torch.no_grad()
     def evaluate_loss(self, model, batch_loader):
-        losses = torch.zeros(self.trainer_cfg.eval_iters)
+        eval_loss = 0
         for iter_idx, eval_batch in enumerate(batch_loader):
-            if iter_idx == self.trainer_cfg.eval_iters:
-                return losses.mean()
-            inputs, targets = eval_batch
-            _, loss = model(inputs, targets)
-            losses[iter_idx] = loss.item()
+            if iter_idx < self.trainer_cfg.eval_iters:
+                inputs, targets = eval_batch
+                _, loss = model(inputs, targets)
+                eval_loss += loss
+            else:
+                return eval_loss / iter_idx
