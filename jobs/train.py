@@ -41,10 +41,14 @@ class TrainJob(ExecutableJobs):
             automatic_checkpoint_naming=True,
             total_limit=50,
         )
+        ddp_kwargs = accelerate.DistributedDataParallelKwargs(
+            comm_hook=accelerate.DDPCommunicationHookType.FP16
+        )
         accelerator = accelerate.Accelerator(
             project_config=project_config,
             log_with="tensorboard",
             gradient_accumulation_steps=self.trainer_cfg.gradient_accumulation_steps,
+            kwargs_handlers=[ddp_kwargs],
         )
         logger = get_logger(__name__, log_level="INFO")
         tokens_per_iter = (
