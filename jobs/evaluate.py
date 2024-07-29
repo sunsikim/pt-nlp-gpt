@@ -26,7 +26,7 @@ class EvaluateJob(ExecutableJobs):
                 meta = pickle.load(f)
             self.stoi = meta.pop("stoi")
             self.itos = meta.pop("itos")
-            self.model_cfg = load_config(self.project_dir, "model")
+            self.model_cfg = load_config("model")
             self.model_cfg.vocab_size = len(self.itos)
 
     def execute(self):

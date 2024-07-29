@@ -23,9 +23,9 @@ class TrainJob(ExecutableJobs):
         self.model_dir.mkdir(exist_ok=True, parents=True)
         self.log_dir = self.temp_dir.joinpath("logs")
         self.log_dir.mkdir(exist_ok=True, parents=True)
-        self.model_cfg = load_config(self.project_dir, "model")
-        self.optimizer_cfg = load_config(self.project_dir, "optimizer")
-        self.trainer_cfg = load_config(self.project_dir, "trainer")
+        self.model_cfg = load_config("model")
+        self.optimizer_cfg = load_config("optimizer")
+        self.trainer_cfg = load_config("trainer")
         self.best_val_loss = 1e9
         self.val_loss_endured = 0
         self.endurance = 10
